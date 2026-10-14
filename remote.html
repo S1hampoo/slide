@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>4면 실시간 인터랙션 · Remote</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  #pad{position:relative;overflow:hidden;touch-action:none}
+  /* 공간 도면 가이드 (투명도 40%) */
+  .face{position:absolute;opacity:.4;display:flex;align-items:center;justify-content:center;
+    font:700 clamp(11px,3.2vmin,26px)/1 "Courier New",monospace;color:#fff;letter-spacing:.04em;
+    text-shadow:0 0 2px #000;pointer-events:none;box-sizing:border-box}
+  .face.side{background:#1656b5}
+  .face.front{background:#97d034}
+  .face.floor{background:#ffb800}
+  #rot{position:fixed;bottom:max(16px,env(safe-area-inset-bottom));left:0;right:0;text-align:center;
+    font:500 13px/1.4 system-ui,sans-serif;color:#7fdcff;opacity:.75;pointer-events:none}
+  /* 연결 상태: 연결 전/끊김일 때만 보이고, 연결되면 잠깐 뒤 사라짐 */
+  #st{position:fixed;top:max(14px,env(safe-area-inset-top));left:0;right:0;text-align:center;
+    font:500 13px/1 system-ui,sans-serif;letter-spacing:.06em;color:#7fdcff;
+    pointer-events:none;transition:opacity .8s;z-index:2}
+  #st.bad{color:#ff7b7b}
+  #st.off{opacity:0}
+  /* 터치 중인 세로 바 (화면 미리보기) */
+  .bar{position:absolute;top:0;transform:translateX(-50%);pointer-events:none;
+    background:linear-gradient(90deg,rgba(255,255,255,0),rgba(255,255,255,.3) 14%,rgba(255,255,255,.88) 34%,#fff 50%,rgba(255,255,255,.88) 66%,rgba(255,255,255,.3) 86%,rgba(255,255,255,0));
+    transition:opacity .4s}
+  .bar.off{opacity:0}
+  /* 감전 깜빡임 */
+  #flash{position:fixed;inset:0;background:#fff;opacity:0;pointer-events:none;z-index:3}
+  #flash.on{animation:zap 1.2s steps(1,end)}
+  @keyframes zap{0%{opacity:1}6%{opacity:0}11%{opacity:.85}15%{opacity:0}22%{opacity:1}26%{opacity:.1}
+    33%{opacity:.7}38%{opacity:0}47%{opacity:.6}52%{opacity:0}63%{opacity:.4}68%{opacity:0}80%{opacity:.25}85%,100%{opacity:0}}
+  #pad.shake{animation:shake .45s linear}
+  @keyframes shake{0%,100%{transform:none}20%{transform:translate(-6px,3px)}40%{transform:translate(5px,-4px)}
+    60%{transform:translate(-4px,-2px)}80%{transform:translate(3px,4px)}}
+</style>
+</head>
+<body>
+<div id="st">연결 중…</div>
+<div id="wrap"><div id="pad"></div></div>
+<div id="rot">휴대폰을 가로로 돌리면 더 크게 보여요</div>
+<div id="flash"></div>
+
+<script>
+/* 디스플레이와 같은 공간 구도 (display.html CONFIG와 맞춰주세요) */
+const FW = 1976, FD = 2868, WH = 1200, SW = 2868;
+const OX = SW, W = SW * 2 + FW, H = WH + FD;   // 7712 × 4068
+const AR = W / H;
+const BAR_RATIO = 320 / W;       // display.html barWidth / 전체폭
+const pad = document.getElementById('pad');
+const st = document.getElementById('st');
+const rot = document.getElementById('rot');
+
+// 면 배치: [이름, 클래스, x, y, w, h]
+const FACES = [
+  ['Side',  'side',  0,       0,  SW, WH],
+  ['Front', 'front', OX,      0,  FW, WH],
+  ['Side',  'side',  OX + FW, 0,  SW, WH],
+  ['Floor', 'floor', OX,      WH, FW, FD]
+];
+for (const [n, c, x, y, w, h] of FACES){
+  const el = document.createElement('div');
+  el.className = 'face ' + c;
+  el.textContent = n;
+  el.style.cssText = `left:${x / W * 100}%;top:${y / H * 100}%;width:${w / W * 100}%;height:${h / H * 100}%`;
+  pad.appendChild(el);
+}
+const inFace = (X, Y) => (Y >= 0 && Y <= WH && X >= 0 && X <= W) || (X >= OX && X <= OX + FW && Y >= WH && Y <= H);
+
+function fit(){
+  const m = 8;
+  let w = innerWidth - m * 2, h = innerHeight - m * 2;
+  if (w / h > AR) w = h * AR; else h = w / AR;
+  pad.style.width = w + 'px'; pad.style.height = h + 'px';
+  rot.style.display = innerHeight > innerWidth ? '' : 'none';
+}
+addEventListener('resize', fit); fit();
+
+let hideT = null;
+function status(t, bad, autoHide){
+  clearTimeout(hideT);
+  st.textContent = t;
+  st.classList.toggle('bad', !!bad);
+  st.classList.remove('off');
+  if (autoHide) hideT = setTimeout(() => st.classList.add('off'), 1200);
+}
+
+/* 연결 대상: ?id=(예전 QR) 또는 ?room= 또는 기본 방 */
+const params = new URLSearchParams(location.search);
+const ROOM = (params.get('room') || 'aplan-neonring').replace(/[^a-z0-9-]/gi, '');
+const TARGET = params.get('id') || ('nr-' + ROOM);
+
+let peer = null, conn = null, retryT = null, openT = null;
+const queue = [];
+
+function scheduleRetry(ms){
+  clearTimeout(retryT);
+  retryT = setTimeout(connect, ms);
+}
+
+function connect(){
+  clearTimeout(retryT); clearTimeout(openT);
+  if (!peer || peer.destroyed){ startPeer(); return; }
+  if (peer.disconnected){ peer.reconnect(); return; }
+  if (conn) try { conn.close(); } catch(e){}
+  status('화면에 연결 중…');
+  const c = peer.connect(TARGET, { reliable: true });
+  conn = c;
+  // 6초 안에 안 열리면 다시 시도
+  openT = setTimeout(() => { if (!c.open){ status('화면을 찾는 중… (화면이 켜져 있나요?)', true); scheduleRetry(500); } }, 6000);
+  c.on('data', d => { if (d && d.t === 'shock') onShock(); });
+  c.on('open', () => {
+    clearTimeout(openT);
+    status('● 연결됨', false, true);
+    while (queue.length) c.send(queue.shift());
+  });
+  c.on('close', () => { if (conn === c){ status('연결 끊김 · 재연결 중…', true); scheduleRetry(1500); } });
+  c.on('error', () => { if (conn === c){ status('연결 오류 · 재시도 중…', true); scheduleRetry(2000); } });
+}
+
+function startPeer(){
+  if (peer && !peer.destroyed) peer.destroy();
+  status('서버 연결 중…');
+  peer = new Peer();
+  peer.on('open', connect);
+  peer.on('disconnected', () => { if (!peer.destroyed) peer.reconnect(); });
+  peer.on('error', err => {
+    if (err.type === 'peer-unavailable'){
+      status('화면을 찾는 중… (화면이 켜져 있나요?)', true);
+      scheduleRetry(2500);
+    } else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)){
+      status('네트워크 오류 · 재시도 중…', true);
+      setTimeout(startPeer, 3000);
+    } else {
+      status('연결 오류(' + err.type + ') · 재시도 중…', true);
+      scheduleRetry(2500);
+    }
+  });
+}
+startPeer();
+
+// 앱 전환 후 돌아오면 재연결
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && !(conn && conn.open)) connect();
+});
+
+/* 터치 → 세로 바 (멀티터치: 손가락마다 바 하나) */
+const flash = document.getElementById('flash');
+const local = new Map();   // pointerId → { el }
+
+function send(msg){
+  if (conn && conn.open) conn.send(msg);
+  else if (msg.t !== 'bm' && queue.length < 30) queue.push(msg);
+}
+function norm(e){
+  const r = pad.getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height, r];
+}
+function placeBar(el, nx, r){
+  const X = nx * W;
+  const inFront = X >= OX && X <= OX + FW;
+  el.style.left = (nx * 100) + '%';
+  el.style.width = Math.max(r.width * BAR_RATIO, 10) + 'px';
+  el.style.height = (inFront ? 100 : WH / H * 100) + '%';
+}
+
+pad.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const [nx, ny, r] = norm(e);
+  if (!inFace(nx * W, ny * H)) return;              // 검정 여백에서 시작한 터치는 무시
+  try { pad.setPointerCapture(e.pointerId); } catch(_){}
+  const el = document.createElement('div');
+  el.className = 'bar';
+  placeBar(el, nx, r);
+  pad.appendChild(el);
+  local.set(e.pointerId, { el });
+  send({ t: 'bd', id: e.pointerId, x: nx, y: ny });
+  if (navigator.vibrate) navigator.vibrate(10);
+});
+
+pad.addEventListener('pointermove', e => {
+  const s = local.get(e.pointerId);
+  if (!s) return;
+  const [nx, ny, r] = norm(e);
+  const cx = Math.max(0, Math.min(1, nx));
+  placeBar(s.el, cx, r);
+  send({ t: 'bm', id: e.pointerId, x: cx, y: ny });
+});
+
+function release(e){
+  const s = local.get(e.pointerId);
+  if (!s) return;
+  local.delete(e.pointerId);
+  s.el.classList.add('off');
+  setTimeout(() => s.el.remove(), 450);
+  send({ t: 'bu', id: e.pointerId });
+}
+pad.addEventListener('pointerup', release);
+pad.addEventListener('pointercancel', release);
+pad.addEventListener('lostpointercapture', release);
+
+/* 디스플레이에서 감전 발동 신호가 오면 휴대폰도 같이 깜빡 + 진동 */
+function onShock(){
+  flash.classList.remove('on'); void flash.offsetWidth; flash.classList.add('on');
+  pad.classList.remove('shake'); void pad.offsetWidth; pad.classList.add('shake');
+  if (navigator.vibrate) navigator.vibrate([40, 30, 70, 30, 40, 50, 120]);
+}
+</script>
+</body>
+</html>
