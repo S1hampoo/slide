@@ -30,6 +30,8 @@
     background:linear-gradient(90deg,rgba(255,255,255,0),rgba(255,255,255,.3) 14%,rgba(255,255,255,.88) 34%,#fff 50%,rgba(255,255,255,.88) 66%,rgba(255,255,255,.3) 86%,rgba(255,255,255,0));
     transition:opacity .4s}
   .bar.off{opacity:0}
+  .bar.h{transform:translateY(-50%);
+    background:linear-gradient(180deg,rgba(255,255,255,0),rgba(255,255,255,.3) 14%,rgba(255,255,255,.88) 34%,#fff 50%,rgba(255,255,255,.88) 66%,rgba(255,255,255,.3) 86%,rgba(255,255,255,0))}
   /* 감전 깜빡임 */
   #flash{position:fixed;inset:0;background:#fff;opacity:0;pointer-events:none;z-index:3}
   #flash.on{animation:zap 1.2s steps(1,end)}
@@ -161,24 +163,36 @@ function norm(e){
   const r = pad.getBoundingClientRect();
   return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height, r];
 }
-function placeBar(el, nx, r){
-  const X = nx * W;
-  const inFront = X >= OX && X <= OX + FW;
-  el.style.left = (nx * 100) + '%';
-  el.style.width = Math.max(r.width * BAR_RATIO, 10) + 'px';
-  el.style.height = (inFront ? 100 : WH / H * 100) + '%';
+// 바닥에서 시작 → 수평 바 (위로 끌면 정면까지), 그 외(벽·검정 여백) → 수직 바
+const onFloor = (X, Y) => X >= OX && X <= OX + FW && Y >= WH && Y <= H;
+function placeBar(el, nx, ny, r, dir){
+  const th = Math.max(r.width * BAR_RATIO, 10) + 'px';
+  if (dir === 'h'){
+    el.classList.add('h');
+    el.style.left = (OX / W * 100) + '%';
+    el.style.width = (FW / W * 100) + '%';
+    el.style.top = (Math.max(0, Math.min(1, ny)) * 100) + '%';
+    el.style.height = th;
+  } else {
+    const X = nx * W;
+    const inFront = X >= OX && X <= OX + FW;
+    el.style.left = (nx * 100) + '%';
+    el.style.width = th;
+    el.style.height = (inFront ? 100 : WH / H * 100) + '%';
+  }
 }
 
 pad.addEventListener('pointerdown', e => {
   e.preventDefault();
   const [nx, ny, r] = norm(e);
-  if (!inFace(nx * W, ny * H)) return;              // 검정 여백에서 시작한 터치는 무시
+  // 검정 여백도 터치 인정 (5손가락 감전 발동을 쉽게) — 여백은 그 위 측면 벽의 수직 바로 처리
   try { pad.setPointerCapture(e.pointerId); } catch(_){}
+  const dir = onFloor(nx * W, ny * H) ? 'h' : 'v';
   const el = document.createElement('div');
   el.className = 'bar';
-  placeBar(el, nx, r);
+  placeBar(el, nx, ny, r, dir);
   pad.appendChild(el);
-  local.set(e.pointerId, { el });
+  local.set(e.pointerId, { el, dir });
   send({ t: 'bd', id: e.pointerId, x: nx, y: ny });
   if (navigator.vibrate) navigator.vibrate(10);
 });
@@ -187,9 +201,9 @@ pad.addEventListener('pointermove', e => {
   const s = local.get(e.pointerId);
   if (!s) return;
   const [nx, ny, r] = norm(e);
-  const cx = Math.max(0, Math.min(1, nx));
-  placeBar(s.el, cx, r);
-  send({ t: 'bm', id: e.pointerId, x: cx, y: ny });
+  const cx = Math.max(0, Math.min(1, nx)), cy = Math.max(0, Math.min(1, ny));
+  placeBar(s.el, cx, cy, r, s.dir);
+  send({ t: 'bm', id: e.pointerId, x: cx, y: cy });
 });
 
 function release(e){
